@@ -9,6 +9,22 @@ var url = require('url');
 var fs = require('fs');
 var pathLib = require("path");
 var gpio=require("pi-gpio");
+var queryString = require("querystring");
+var async=require("async");
+
+/*
+ * current working directory for creating response and command files 
+ */
+var cwd;
+cwd = __dirname;
+console.log('Retreiving current working directory for the script: ' + cwd);
+
+/*
+ * open files for intermediate use 
+ */
+var responseFile, commandFile;
+responseFile = pathLib.join(cwd, 'response');
+commandFile  = pathLib.join(cwd, 'command' );
 
 var GpioPins = {};
 var Commands;
@@ -45,7 +61,7 @@ var responseMaxRepeats = 200;
 
 var server = http.createServer(request);
 var serverAddress = getIp('wlan0');
-var serverPort = 8080;
+var serverPort = 8081;
 var pin;
 var pinstatus;
 var value;
@@ -67,67 +83,19 @@ console.log('Web Server running at eth0 ' + serverAddress + ':'+ serverPort + ',
  */
 pinInit(ON);
 
-
 // request and response handling 
 function request( req, response ) {
 
     var command, path;
+    var theUrl;
+
     responseCache = response;
     requestCache = req;
     command = "";
-    console.log("request received");
-    path = url.parse(req.url).pathname;
-    console.log(path);
 
-    // client would send the device name followed by ON/OFF to turn ON/OFF device
-    if( path.indexOf("AllPowerPin")) {
-        console.log(path);
-        parseReq(path, response);
-    }		
-    else if( path.indexOf("setTopBoxPowerPin")) {
-        parseReq(path, response);
-    }		
-    else if( path.indexOf("TvPowerPin")) {
-        parseReq(path, response);
-    }		
-    else if( path.indexOf("WiFiRouterPowerPin")) {
-        parseReq(path, response);
-    }		
-    else if( path.indexOf("SoundSystemPowerPin")) {
-        parseReq(path, response);
-    }		
-    else if (path.indexOf("tatasky") === 1) {
-	
-        // treat as a REST request for arduino command, e.g. /arduino/analog/0)
-        command = path.substring(9, path.length);
-        console.log(command);
-	    
-	    writeCommand(command);
-        responseCheck = 0;
-	    // fixme [gp]
-	    sendResponse(response, command);
-    }
-    else if (path.indexOf("galileo") == 1)
-    {
-	
-	    // treat as a REST request for arduino command, e.g. /arduino/analog/0)
-        command = path.substring(9, path.length);
-        console.log(command);
+    // parse request received at the server
+    parseReq(req, response);
 
-	    // look IR commands up 
-	    if (commands_lookup[command]){
-	        Commands = commands_lookup[command];
-	        Commands.forEach(RemoteCodeSend);
-	    } else {
-	        // response as 
-	    }
-	    sendResponse(response, command);
-	
-    }
-    else {
-        // serve a webpage
-        serveHTML(response,path);
-    }
 }
 
 /* 
@@ -135,21 +103,28 @@ function request( req, response ) {
  * function to write response to mailbox file to pass commands to arduino sketch
  */
 function writeCommand(command) {
-    // delete any pending responses to make sure we get a fresh one
+
+    /* 
+     * delete any pending responses to make sure we get a fresh one
+     */
     try {
-        fs.writeFileSync('/tmp/response', "none");
+        fs.writeFileSync(responseFile, "success\n");
         //console.log("deleted OLD response");
     } catch(e) {
-        console.log("writeCommand can't clear response");
+        console.log("Error: writeCommand can't clear response");
+        console.log("Error: Response trying to write" + response);
     }
     
+    /*
+     * write the command to the command file 
+     */ 
     try {
-        fs.writeFileSync('/tmp/command', command);
+        fs.writeFileSync(commandFile, command);
     } catch(e) {
-        console.log("writeCommand can't write command");
+        console.log("Error: writeCommand can't write command");
+        console.log('Error: Command trying to write: ' + command);
     }
      
-    console.log('command: ' + command);
 }
 
 /*
@@ -165,12 +140,22 @@ function RemoteCodeSend(element, index, array){
  * function to send Response back to the client
  * fixme: gp : clearly define response handling for all the events
  */
-function sendResponse(res, command) {
+function sendResponse(res, command, jsonObjList) {
     var responseExists = false;
     var responseCheck = 0;
     var data = "";
     var dataStr;
     var dataParts;
+    var objectList = {};
+    var json;
+
+
+    /*
+     * append objects to final return sequence
+     */ 
+    for (var key in jsonObjList) {
+        objectList[key] = jsonObjList[key];
+    }
 
     /* 
      * when file exists, get its contents and return to http request
@@ -178,7 +163,7 @@ function sendResponse(res, command) {
      */ 
     while(!responseExists && responseCheck < responseMaxRepeats) {
         try {
-            data = fs.readFileSync('/tmp/response');
+            data = fs.readFileSync(responseFile);
             dataStr = data + ""; // convert data to a string
             if (data != "none" && dataStr.indexOf("\n") >= 0) {
                 responseExists = true;
@@ -191,20 +176,32 @@ function sendResponse(res, command) {
         }
     }
 
+    /*
+     * if response couldn't be synced up, then send FAIL as the json tag for login
+     */ 
     if (responseCheck >= responseMaxRepeats) {
         console.log("sendResponse tried too many times: " + responseCheck);
-        res.writeHead(200, {'Content-Type': 'text/plain'});
-	    res.end("response not received\n");
-        res.end("");
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        // update login status to FAIL if not able to respond
+        objectList = {
+            "login": "FAIL",
+        };
+        json = JSON.stringify(objectList);
+        console.log('sending Failure response' + json);
+        res.end(json);
 
     } else {
 
-        res.writeHead(200, {'Content-Type': 'text/plain'});
-        res.end(dataStr);
-	    res.end("");
-
+    /*
+     * if we are able to sync response, then send SUCCESS as the JSON 
+     */
+        res.writeHead(200, {'Content-Type': 'application/json'});
+        // update login status if response is available
+        json = JSON.stringify(objectList);
+        console.log('sending Successfull response' + json);
+        res.end(json);
         try {
-            fs.writeFileSync('/tmp/response', "none");
+            fs.writeFileSync(responseFile, json);
         } catch(e) {
             console.log("sendResponse can't clear response");
         }
@@ -310,6 +307,58 @@ function sys_command_exec(cmd, callback)
 }
 
 /*
+ * function to read from a Gpio pin
+ */
+function pinRead(pin, callback) {
+
+    // start with checking if there is already a direction set for the requested pin
+    gpio.getDirection(pin, function(err, direction) {
+
+        /*
+         * error handling - 
+         * If there is no error that mean pin is already exported and available
+         * for read. 
+         * If there is an error, then we have to export the pin and make it an
+         * input pin
+         */
+
+        if(err) {
+             //try opening the pin with output mode, if success, then just read the pin 
+             console.log('Error while getting direction for pin' + pin);
+             try {
+                 gpio.open(pin, 'output', function (err) {
+
+                     // if error, then couldn't open the pin as input at all
+                     // give up here and throw err for catch  
+                     if(err) {
+                        throw(err);
+                     } else {
+                         // add in the call back function to process the err and the value
+                         gpio.read(pin, function (err, value) {
+                             callback(err, value);
+                         });
+                     }
+                 });
+             }
+
+             // catch error while trying to open pin as input
+             catch(err) {
+                 console.log('Error: Could not open pin ' + pin + ' for reading, detailed error message as below');
+                 console.log(err);
+             }
+
+        } else {
+
+            // try changing pin direction to input and post a read request
+            console.log('Direction of pin ' + pin + ' set to output but reading anyway');
+            gpio.read(pin, function(err, value) {
+                callback(err, value);
+            });
+        }
+    });
+}
+
+/*
  * function to write to Gpio pin
  */ 
 function pinWrite(pin,value) {
@@ -351,27 +400,40 @@ function pinWrite(pin,value) {
 		    fixme: add some response back to the server for error handling
 		    */
 		    catch (err){
-		    	console.log('Error: Cannot open Gpio pin ' + pin);
+		    	console.log('Error: Cannot open Gpio pin ' + pin + ' for a write');
 		    }
         } else{
 		    /*
 		    check if the direction is set to input 
 		    */
-            console.log('Pin ' + pin + ' set to input, changing over mode to output');
-            gpio.setDirection(pin,'output', function(err){
-                    if(err) {
-                            console.log(err);
-                            throw err;
+            if(direction == 'input') {
+                
+                console.log('Direction of pin ' + pin + ' is set to input, changing it to output for write');
+                gpio.setDirection(pin,'output', function(err){
+                        if(err) {
+                                console.log(err);
+                                throw err;
+                        } else {
+                                gpio.write(pin, value, function(err){
+                                        if(!err){
+                                                console.log('Write to pin ' + pin + ' with a value: ' + value);
+                                        } else {
+                                               // fixme: send response back to the server here
+                                        }
+                                });
+                        }
+                });
+            } else {
+
+                gpio.write(pin, value, function(err){
+                    if(!err){
+                    console.log('Write to pin ' + pin + ' with a value: ' + value);
                     } else {
-                            gpio.write(pin, value, function(err){
-                                    if(!err){
-                                            console.log('Write to pin ' + pin + ' with a value: ' + value);
-                                    } else {
-                                           // fixme: send response back to the server here
-                                    }
-                            });
+                    // fixme: send response back to the server here
                     }
-            });
+                });
+
+            }
 		}
 	
     });
@@ -392,36 +454,96 @@ function pinInit(value) {
     });
 }
 
+
+
+
 /*
  * function to parse http requests and process pinWrites
  */
-function parseReq(reqPath, response) {
+function parseReq(req, response) {
 
-        var command;
-	    var pinstatus;
+        var command, pinstatus;
         var pin, value;
-    
+        var path, query, paramsValue;
+        var objList = {};
+            
         /*
          * parse pin value and status from the request
+         * first check if these are login requests/status requests - will be in the form of query
+         * or write requests for setting pin values
          */ 
-        command = reqPath.substring(1,reqPath.length);
-	    pinstatus = command.split('=');
-        
-        if(pinstatus[0] == 'AllPowerPin') {
+        query = url.parse(req.url).query;
+        paramsValue = queryString.parse(query);
+        // initialize an empty response list
 
-            value = (pinstatus[1] == 'OFF');
-            pinInit(value);
+    
+        console.log(url.parse(req.url).path);
+
+        if(paramsValue['opcode'] === "login") {
+
+            /*
+             * create the json response with SUCCESS as the status if login query is received
+             */ 
+            writeCommand(command);
+            responseCheck =0;
+            objList['login'] = 'SUCCESS';
+            sendResponse(response, command, objList);
+
+        } else if (paramsValue['opcode'] === "status") {
+
+            /*
+             * this section will simply read and respond back with current GPIO pin status
+             * of the raspberry Pi for each of the pins
+             */
+            var readItemsProcessed = 0;
+            async.forEach(Object.keys(GpioPins), function (key, callback){ 
+
+                pinRead(GpioPins[key], function (err, value) { 
+                    if(value == 1) {
+                        objList[key] = 'OFF';
+                    } else {
+                        objList[key] = 'ON';
+                    }
+
+                    readItemsProcessed++;
+                    console.log('Read items processed' + readItemsProcessed);
+                    if( readItemsProcessed === (Object.keys(GpioPins).length)) {
+                        callback(); // tell async that the iterator has completed
+                        writeCommand(command);
+                        responseCheck =0;
+                        objList['status'] = 'SUCCESS';
+                        sendResponse(response, command, objList);
+                        readItemsProcessed = 0;
+                    }
+                });
+
+            });  
+
+        } else if(paramsValue['opcode'] === 'write') {
+
+            var writeItemsProcessed = 0;
             
-        } else {
+            // check what GPIO pins were to be written by the params
+            async.forEach(Object.keys(paramsValue), function (key, callback) {
 
-	        pin = GpioPins[pinstatus[0]];
-            value = (pinstatus[1] == 'OFF');
-            pinWrite(pin, value);
+                console.log('key: ' + key);
+                console.log('paramsValue[key]: ' + paramsValue[key]);
+
+                // check if the parameter is one of the Gpio pins
+                if(GpioPins.hasOwnProperty(key)) {
+                    writeCommand(command);
+                    pinWrite(GpioPins[key], parseInt(paramsValue[key]));
+                    callback();
+                }
+
+                writeItemsProcessed++;
+                if( writeItemsProcessed === (Object.keys(paramsValue).length)) {
+                   objList = {};
+                   sendResponse(response, command, objList);
+                   writeItemsProcessed = 0;
+                }
+            });
+            
         }
 
-	    writeCommand(command);
-        responseCheck = 0;
-	    // fixme [gp]
-        // write some response back to the client
-	    sendResponse(response, command);
 }
